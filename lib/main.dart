@@ -408,16 +408,62 @@ class _Main extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        Align(
-          alignment: Alignment.centerRight,
-          child: TextButton(
-            onPressed: () => showModalBottomSheet<void>(
-              context: context,
-              builder: (_) => _LogSheet(cam: cam),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            TextButton(
+              onPressed: () => showModalBottomSheet<void>(
+                context: context,
+                builder: (_) => const _EmojiSheet(),
+              ),
+              child: const Text('Emojis'),
             ),
-            child: const Text('Logs'),
-          ),
+            TextButton(
+              onPressed: () => showModalBottomSheet<void>(
+                context: context,
+                builder: (_) => _LogSheet(cam: cam),
+              ),
+              child: const Text('Logs'),
+            ),
+          ],
         ),
+      ],
+    );
+  }
+}
+
+const famousEmojis = [
+  '😀', '😂', '🤣', '😊', '😍', '🥰', '😘', '😎', '🤩', '🥳',
+  '😭', '😢', '😡', '🤔', '🙄', '😴', '🤯', '😱', '🥺', '😇',
+  '😉', '😜', '🤪', '🤗', '🤫', '😏', '😬', '🤮', '🤒', '😷',
+  '👍', '👎', '👏', '🙌', '🙏', '💪', '👌', '✌️', '🤞', '🤝',
+  '👋', '🤙', '👀', '🧠', '💀', '👻', '👽', '🤖', '💩', '🙈',
+  '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '💔', '💯', '🔥',
+  '✨', '⭐', '🌟', '🎉', '🎊', '🎁', '🎈', '🏆', '🎵', '📸',
+  '🍎', '🍕', '🍔', '🍟', '🍦', '🍩', '☕', '🍻', '🌈', '☀️',
+  '🌙', '🐶', '🐱', '🦄', '🌹', '🚀', '💡', '💸', '✅', '❌',
+];
+
+class _EmojiSheet extends StatelessWidget {
+  const _EmojiSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.count(
+      crossAxisCount: 8,
+      padding: const EdgeInsets.all(12),
+      children: [
+        for (final e in famousEmojis)
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () {
+              Clipboard.setData(ClipboardData(text: e));
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text('$e copied')));
+            },
+            child: Center(child: Text(e, style: const TextStyle(fontSize: 26))),
+          ),
       ],
     );
   }
