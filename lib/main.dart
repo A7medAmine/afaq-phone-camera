@@ -17,6 +17,9 @@ const navy = Color(0xFF030A2E);
 const sun = Color(0xFFFFD23F);
 const pink = Color(0xFFFF5FA2);
 
+/// After this long without a touch the phone shows a black standby screen instead of the preview.
+const standbyAfter = Duration(seconds: 60);
+
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(_KeepAliveHandler());
@@ -86,6 +89,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String? _ip;
   bool _denied = false;
   bool _loading = true;
+  bool _standby = false;
+  Timer? _standbyTimer;
   String? _serverError;
 
   @override
@@ -94,6 +99,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _boot();
     _ipTimer = Timer.periodic(const Duration(seconds: 5), (_) => _refreshIp());
+    _touched();
+  }
+
+  void _touched() {
+    _standbyTimer?.cancel();
+    _standbyTimer = Timer(standbyAfter, () {
+      if (mounted) setState(() => _standby = true);
+    });
+    if (_standby) setState(() => _standby = false);
   }
 
   Future<void> _boot() async {
@@ -152,9 +166,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       for (final i in ifaces) {
         for (final a in i.addresses) {
           final ip = a.address;
-          final private = ip.startsWith('192.168.') ||
-              ip.startsWith('10.') ||
-              RegExp(r'^172\.(1[6-9]|2\d|3[01])\.').hasMatch(ip);
+          final private =
+              ip.startsWith('192.168.') || ip.startsWith('10.') || RegExp(r'^172\.(1[6-9]|2\d|3[01])\.').hasMatch(ip);
           if (!private) continue;
           final mobile = i.name.startsWith('rmnet') || i.name.startsWith('ccmni');
           if (mobile) continue;
@@ -170,7 +183,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final cam = _cam;
     if (state == AppLifecycleState.resumed && cam != null && !cam.running && !_denied) {
-      cam.restart();
+      if (cam.viewers > 0 || !cam.settings.autoSleep) cam.wake();
     }
   }
 
@@ -178,6 +191,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _ipTimer?.cancel();
+    _standbyTimer?.cancel();
     _server?.stop();
     _cam?.dispose();
     WakelockPlus.disable();
@@ -187,23 +201,64 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final cam = _cam;
+    final server = _server;
+    if (_standby && cam != null && server != null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _touched,
+          child: ListenableBuilder(listenable: cam, builder: (context, _) => _Standby(cam: cam, ip: _ip)),
+        ),
+      );
+    }
     return Scaffold(
-      body: SafeArea(
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _denied || cam == null
-                ? _PermissionView(onRetry: _boot)
-                : ListenableBuilder(
+      body: Listener(
+        onPointerDown: (_) => _touched(),
+        child: SafeArea(
+          child:
+              _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _denied || cam == null
+                  ? _PermissionView(onRetry: _boot)
+                  : ListenableBuilder(
                     listenable: cam,
-                    builder: (context, _) => _Main(
-                      cam: cam,
-                      server: _server!,
-                      ip: _ip,
-                      serverError: _serverError,
-                      onRetry: _boot,
-                      onServiceChange: _syncService,
-                    ),
+                    builder:
+                        (context, _) => _Main(
+                          cam: cam,
+                          server: _server!,
+                          ip: _ip,
+                          serverError: _serverError,
+                          onServiceChange: _syncService,
+                        ),
                   ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Pure black keeps OLED screens cool; nothing is rendered from the camera here.
+class _Standby extends StatelessWidget {
+  const _Standby({required this.cam, required this.ip});
+  final CameraService cam;
+  final String? ip;
+
+  @override
+  Widget build(BuildContext context) {
+    const dim = TextStyle(color: Color(0xFF5A5A5A), fontSize: 14);
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            cam.running ? 'Camera on · ${cam.viewers} viewer${cam.viewers == 1 ? '' : 's'}' : 'Camera asleep',
+            style: dim,
+          ),
+          if (ip != null) Text('http://$ip:$serverPort', style: dim),
+          const SizedBox(height: 6),
+          const Text('Tap to show controls', style: dim),
+        ],
       ),
     );
   }
@@ -244,7 +299,6 @@ class _Main extends StatelessWidget {
     required this.server,
     required this.ip,
     required this.serverError,
-    required this.onRetry,
     required this.onServiceChange,
   });
 
@@ -252,7 +306,6 @@ class _Main extends StatelessWidget {
   final CameraServer server;
   final String? ip;
   final String? serverError;
-  final VoidCallback onRetry;
   final Future<void> Function() onServiceChange;
 
   @override
@@ -268,23 +321,40 @@ class _Main extends StatelessWidget {
         _Card(
           child: SizedBox(
             height: 200,
-            child: cam.error != null
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(cam.error!, textAlign: TextAlign.center),
-                        const SizedBox(height: 10),
-                        _ChunkyButton(label: 'Try again', color: sun, onTap: onRetry),
-                      ],
-                    ),
-                  )
-                : controller != null && controller.value.isInitialized
+            child:
+                cam.error != null
+                    ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(cam.error!, textAlign: TextAlign.center),
+                          const SizedBox(height: 10),
+                          _ChunkyButton(label: 'Try again', color: sun, onTap: cam.wake),
+                        ],
+                      ),
+                    )
+                    : controller != null && controller.value.isInitialized
                     ? ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: Center(child: CameraPreview(controller)),
-                      )
-                    : const Center(child: CircularProgressIndicator()),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Center(child: CameraPreview(controller)),
+                    )
+                    : cam.waking
+                    ? const Center(child: CircularProgressIndicator())
+                    : Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.bedtime, size: 40, color: sun),
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Camera asleep to save battery and heat.\nIt wakes when the booth starts.',
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 10),
+                          _ChunkyButton(label: 'Wake now', color: sun, onTap: cam.wake),
+                        ],
+                      ),
+                    ),
           ),
         ),
         const SizedBox(height: 12),
@@ -297,10 +367,19 @@ class _Main extends StatelessWidget {
                 children: [
                   Icon(Icons.circle, size: 14, color: server.running ? Colors.greenAccent : pink),
                   const SizedBox(width: 8),
-                  Text(server.running ? 'Running' : 'Stopped', style: const TextStyle(fontWeight: FontWeight.w700)),
+                  Text(
+                    !server.running
+                        ? 'Stopped'
+                        : cam.running
+                        ? 'Running'
+                        : 'Standby',
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
                   const Spacer(),
-                  Text('${cam.viewers} viewer${cam.viewers == 1 ? '' : 's'}'
-                      '${cam.viewers > 0 ? ' · ${cam.fps.toStringAsFixed(1)} fps' : ''}'),
+                  Text(
+                    '${cam.viewers} viewer${cam.viewers == 1 ? '' : 's'}'
+                    '${cam.viewers > 0 ? ' · ${cam.fps.toStringAsFixed(1)} fps' : ''}',
+                  ),
                 ],
               ),
               const SizedBox(height: 12),
@@ -372,6 +451,20 @@ class _Main extends StatelessWidget {
               ),
               Row(
                 children: [
+                  const Text('Max frame rate'),
+                  const Spacer(),
+                  DropdownButton<int>(
+                    value: s.maxFps,
+                    items: [for (final f in fpsCaps) DropdownMenuItem(value: f, child: Text('$f fps'))],
+                    onChanged: (v) {
+                      s.maxFps = v ?? s.maxFps;
+                      cam.updateSettings();
+                    },
+                  ),
+                ],
+              ),
+              Row(
+                children: [
                   Text('Rotation: ${s.rotation} degrees'),
                   const Spacer(),
                   _ChunkyButton(
@@ -387,10 +480,22 @@ class _Main extends StatelessWidget {
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Full-size photos (slower)'),
-                subtitle: const Text('Off: instant photo at stream size. On: about 12 MP, but the picture freezes for a moment'),
+                subtitle: const Text(
+                  'Off: instant photo at stream size. On: about 12 MP, but the picture freezes for a moment',
+                ),
                 value: s.fullResStill,
                 onChanged: (v) {
                   s.fullResStill = v;
+                  cam.updateSettings();
+                },
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Sleep camera when the booth is not watching'),
+                subtitle: const Text('Keeps the phone cool. The camera wakes in about a second when the booth starts'),
+                value: s.autoSleep,
+                onChanged: (v) {
+                  s.autoSleep = v;
                   cam.updateSettings();
                 },
               ),
@@ -411,10 +516,7 @@ class _Main extends StatelessWidget {
         Align(
           alignment: Alignment.centerRight,
           child: TextButton(
-            onPressed: () => showModalBottomSheet<void>(
-              context: context,
-              builder: (_) => _LogSheet(cam: cam),
-            ),
+            onPressed: () => showModalBottomSheet<void>(context: context, builder: (_) => _LogSheet(cam: cam)),
             child: const Text('Logs'),
           ),
         ),
@@ -431,14 +533,14 @@ class _LogSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     return ValueListenableBuilder<List<String>>(
       valueListenable: cam.logs,
-      builder: (context, lines, _) => ListView(
-        padding: const EdgeInsets.all(12),
-        reverse: true,
-        children: [
-          for (final l in lines.reversed)
-            Text(l, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
-        ],
-      ),
+      builder:
+          (context, lines, _) => ListView(
+            padding: const EdgeInsets.all(12),
+            reverse: true,
+            children: [
+              for (final l in lines.reversed) Text(l, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+            ],
+          ),
     );
   }
 }

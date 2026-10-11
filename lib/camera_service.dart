@@ -8,6 +8,9 @@ import 'settings.dart';
 
 class BusyException implements Exception {}
 
+/// How long the camera stays open after the last viewer leaves.
+const sleepGrace = Duration(seconds: 10);
+
 class CameraService extends ChangeNotifier {
   CameraService(this.settings);
 
@@ -30,10 +33,14 @@ class CameraService extends ChangeNotifier {
   double fps = 0;
   int _fpsCount = 0;
   DateTime _fpsStart = DateTime.now();
+  DateTime _lastEncode = DateTime.fromMillisecondsSinceEpoch(0);
+  Future<void>? _opening;
+  Timer? _sleepTimer;
 
   Stream<Uint8List> get frames => _frames.stream;
   ValueListenable<List<String>> get logs => _logs;
   bool get running => controller?.value.isInitialized ?? false;
+  bool get waking => _opening != null;
 
   void log(String line) {
     final t = DateTime.now().toIso8601String().substring(11, 19);
@@ -44,7 +51,40 @@ class CameraService extends ChangeNotifier {
   void viewersChanged(int n) {
     viewers = n;
     if (n == 0) fps = 0;
+    if (n > 0) {
+      wake();
+    } else {
+      _scheduleSleep();
+    }
     notifyListeners();
+  }
+
+  /// Opens the camera if it is closed. Safe to call repeatedly.
+  Future<void> wake() {
+    _sleepTimer?.cancel();
+    if (running || _restarting) return Future.value();
+    return _opening ??= _open(_streamPreset).whenComplete(() {
+      _opening = null;
+      if (viewers == 0) _scheduleSleep();
+    });
+  }
+
+  /// Closes the camera so the phone stays cool while the booth is not watching.
+  Future<void> sleep() async {
+    _sleepTimer?.cancel();
+    if (!settings.autoSleep || _photoBusy || _restarting || _opening != null || controller == null) return;
+    await _close();
+    fps = 0;
+    log('camera asleep');
+    notifyListeners();
+  }
+
+  void _scheduleSleep() {
+    _sleepTimer?.cancel();
+    if (!settings.autoSleep || viewers > 0) return;
+    _sleepTimer = Timer(sleepGrace, () {
+      if (viewers == 0) sleep();
+    });
   }
 
   CameraDescription? _pick(String lens) {
@@ -57,14 +97,13 @@ class CameraService extends ChangeNotifier {
 
   int get _sensor => controller?.description.sensorOrientation ?? 90;
 
-  ResolutionPreset get _streamPreset => const [
-        ResolutionPreset.medium,
-        ResolutionPreset.high,
-        ResolutionPreset.veryHigh,
-      ][streamPresets[settings.preset].level];
+  static const _presets = [ResolutionPreset.medium, ResolutionPreset.high, ResolutionPreset.veryHigh];
 
+  ResolutionPreset get _streamPreset => _presets[streamPresets[settings.preset].level];
+
+  /// With auto sleep the camera waits for the booth; otherwise it opens right away.
   Future<void> start() async {
-    await _open(_streamPreset);
+    if (!settings.autoSleep) await wake();
   }
 
   Future<void> _open(ResolutionPreset preset, {bool stream = true}) async {
@@ -72,12 +111,7 @@ class CameraService extends ChangeNotifier {
       if (_cameras.isEmpty) _cameras = await availableCameras();
       final desc = _pick(settings.lens);
       if (desc == null) throw CameraException('none', 'No camera found on this phone');
-      final c = CameraController(
-        desc,
-        preset,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-      );
+      final c = CameraController(desc, preset, enableAudio: false, imageFormatGroup: ImageFormatGroup.yuv420);
       await c.initialize();
       controller = c;
       _openPreset = preset;
@@ -109,8 +143,14 @@ class CameraService extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// Reopens the camera with new settings. A sleeping camera stays asleep.
   Future<void> restart() async {
     if (_restarting || _photoBusy) return;
+    await _opening;
+    if (!running && settings.autoSleep && viewers == 0) {
+      notifyListeners();
+      return;
+    }
     _restarting = true;
     await _close();
     notifyListeners();
@@ -144,10 +184,19 @@ class CameraService extends ChangeNotifier {
     await settings.save();
     notifyListeners();
     if (running && _openPreset != _streamPreset) await restart();
+    if (settings.autoSleep) {
+      _scheduleSleep();
+    } else {
+      await wake();
+    }
   }
 
   void _onFrame(CameraImage frame) {
     if (_converting || viewers == 0 || _photoBusy) return;
+    // Encoding is the hot path, so frames beyond the cap are dropped before any work is done.
+    final now = DateTime.now();
+    if (now.difference(_lastEncode).inMilliseconds < 1000 ~/ settings.maxFps) return;
+    _lastEncode = now;
     _converting = true;
     final rotation = (_sensor + settings.rotation) % 360;
     FrameEncoder.encodeFrame(frame, rotation: rotation, quality: streamPresets[settings.preset].quality)
@@ -177,6 +226,11 @@ class CameraService extends ChangeNotifier {
     _photoBusy = true;
     final sw = Stopwatch()..start();
     try {
+      if (!running && !settings.fullResStill) {
+        await wake();
+        // Give auto exposure a moment after a cold start.
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+      }
       final bytes = await _capture();
       // Browsers apply the EXIF orientation themselves, so pixels are only rewritten for a manual rotation.
       final upright = settings.rotation == 0 ? bytes : await FrameEncoder.uprightStill(bytes, settings.rotation);
@@ -190,6 +244,8 @@ class CameraService extends ChangeNotifier {
     } catch (e) {
       _photoBusy = false;
       rethrow;
+    } finally {
+      _scheduleSleep();
     }
   }
 
@@ -207,6 +263,7 @@ class CameraService extends ChangeNotifier {
         _photoBusy = false;
       }
     }
+    await _opening;
     await _close();
     await _open(ResolutionPreset.max, stream: false);
     Uint8List? bytes;
@@ -218,7 +275,12 @@ class CameraService extends ChangeNotifier {
       failure = e.toString();
     }
     final reason = failure ?? error ?? 'Camera is not running';
-    _close().then((_) => _open(_streamPreset)).whenComplete(() => _photoBusy = false);
+    final reopen = viewers > 0 || !settings.autoSleep;
+    _close().then((_) => reopen ? _open(_streamPreset) : null).whenComplete(() {
+      _photoBusy = false;
+      _scheduleSleep();
+      notifyListeners();
+    });
     if (bytes == null) throw StateError(reason);
     return bytes;
   }
@@ -241,6 +303,7 @@ class CameraService extends ChangeNotifier {
 
   @override
   Future<void> dispose() async {
+    _sleepTimer?.cancel();
     await _close();
     await _frames.close();
     super.dispose();

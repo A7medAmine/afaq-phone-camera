@@ -40,14 +40,20 @@ class CameraServer {
     }
   }
 
-  Map<String, Object?> health() => {
-        'ok': camera.running,
-        'camera': camera.settings.lens,
-        'width': camera.streamW,
-        'height': camera.streamH,
-        'stillWidth': camera.stillW,
-        'stillHeight': camera.stillH,
-      };
+  // ok means the app answers and the camera has no error; a sleeping camera is still ok.
+  // A failed camera is retried on each health check, which the booth sends while reconnecting.
+  Map<String, Object?> health() {
+    if (camera.error != null && !camera.running && !camera.waking) camera.wake();
+    return {
+      'ok': camera.error == null,
+      'active': camera.running,
+      'camera': camera.settings.lens,
+      'width': camera.streamW,
+      'height': camera.streamH,
+      'stillWidth': camera.stillW,
+      'stillHeight': camera.stillH,
+    };
+  }
 
   void _cors(HttpResponse r) {
     r.headers
@@ -88,6 +94,12 @@ class CameraServer {
           await camera.setLens(lens as String);
           await _json(res, 200, health());
         }
+      } else if (req.method == 'POST' && path == '/wake') {
+        await camera.wake();
+        await _json(res, 200, health());
+      } else if (req.method == 'POST' && path == '/sleep') {
+        if (_clients.isEmpty) await camera.sleep();
+        await _json(res, 200, health());
       } else if (req.method == 'POST' && path == '/torch') {
         final body = await _readJson(req);
         await camera.setTorch(body['on'] == true);
@@ -167,17 +179,18 @@ class _StreamClient {
     if (_busy || _closed) return;
     _busy = true;
     try {
-      res.add(utf8.encode(
-        '--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n',
-      ));
+      res.add(utf8.encode('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n'));
       res.add(jpeg);
       res.add(const [13, 10]);
-      res.flush().then((_) {
-        _busy = false;
-      }).catchError((_) {
-        _busy = false;
-        _finish();
-      });
+      res
+          .flush()
+          .then((_) {
+            _busy = false;
+          })
+          .catchError((_) {
+            _busy = false;
+            _finish();
+          });
     } catch (_) {
       _busy = false;
       _finish();
